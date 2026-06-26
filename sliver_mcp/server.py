@@ -50,6 +50,7 @@ from .manager import SliverManager, payload_dir
 from .serializers import (
     decode_download,
     serialize_beacon,
+    serialize_beacon_task,
     serialize_execute,
     serialize_job,
     serialize_ls,
@@ -508,6 +509,62 @@ def build_server(manager: SliverManager):
     # ======================================================================
     # Execution
     # ======================================================================
+    async def _beacon_pending_status(target_id: str, command: str) -> dict:
+        """Shape a beacon execute timeout as a structured pending/dead status.
+
+        A beacon task only completes on the next check-in, so within
+        ``BEACON_TASK_TIMEOUT`` it is normal for the task to still be queued.
+        Rather than an opaque timeout error, report whether the beacon is alive
+        (task pending — it will run on the next check-in) or dead (task
+        undeliverable), with the check-in timing so the caller can decide to wait
+        or move on. Poll :func:`get_beacon_tasks` to watch the task progress.
+        """
+        b = await mgr.client.beacon_by_id(target_id)
+        if b is None:
+            return err(
+                f"beacon {target_id} is no longer registered — the task may have "
+                "been delivered but the beacon is gone")
+        info = serialize_beacon(b)
+        common = dict(
+            beacon_id=target_id,
+            command=command,
+            next_checkin=info.get("next_checkin"),
+            last_checkin=info.get("last_checkin"),
+            interval=info.get("interval"),
+            jitter=info.get("jitter"),
+            tasks_count=info.get("tasks_count"),
+            tasks_completed=info.get("tasks_completed"),
+            waited_seconds=BEACON_TASK_TIMEOUT,
+        )
+        if info.get("is_dead"):
+            return err(
+                "beacon is marked dead — the task could not be delivered",
+                task_state="dead", is_dead=True, **common)
+        return ok(
+            "task queued — awaiting beacon check-in",
+            task_state="queued", is_dead=False,
+            hint=("the task is pending and will run on the beacon's next "
+                  "check-in; poll get_beacon_tasks(beacon_id) or list_beacons, "
+                  "or raise SLIVER_TASK_TIMEOUT to wait longer"),
+            **common)
+
+    async def _resolve_exec(coro_result: Any, kind: str, target_id: str,
+                            command: str) -> tuple[Any, dict | None]:
+        """Resolve an execute result, turning a *beacon* timeout into a
+        structured pending/dead status instead of an opaque error.
+
+        Returns ``(message, None)`` when the task completed (caller serializes
+        the message), or ``(None, status_dict)`` when a beacon task is still
+        queued / the beacon is dead (caller returns the dict directly). Session
+        results always resolve immediately.
+        """
+        try:
+            return await _maybe_await(coro_result), None
+        except (asyncio.TimeoutError, TimeoutError):
+            if kind == "beacon":
+                return None, await _beacon_pending_status(target_id, command)
+            raise
+
     @tool(tier="yellow")
     async def execute(
         target_id: str, path: str, args: list[str] | None = None, output: bool = True
@@ -515,27 +572,62 @@ def build_server(manager: SliverManager):
         """Run an executable on a session or beacon. yellow-tier (host telemetry).
 
         ``target_id`` resolves to a session or beacon automatically. For beacons
-        the result returns once the next check-in completes the task.
+        the result returns once the next check-in completes the task; if the
+        check-in does not arrive within ``SLIVER_TASK_TIMEOUT`` the call returns a
+        structured ``task_state="queued"`` status (the task is still pending) or
+        ``task_state="dead"`` (the beacon is gone) instead of a bare timeout.
         """
         interactive, kind = await mgr.interact(target_id)
         if interactive is None:
             return err(f"no session or beacon with id {target_id}")
-        res = await _maybe_await(await interactive.execute(path, args or [], output))
+        res, pending = await _resolve_exec(
+            await interactive.execute(path, args or [], output), kind, target_id, path)
+        if pending is not None:
+            return pending
         return ok(target_kind=kind, **serialize_execute(res))
 
     @tool(tier="yellow")
     async def execute_command(
         target_id: str, command_line: str, output: bool = True
     ) -> dict:
-        """Convenience: shell-split ``command_line`` and run it. yellow-tier."""
+        """Convenience: shell-split ``command_line`` and run it. yellow-tier.
+
+        On a beacon, a task that has not been picked up within
+        ``SLIVER_TASK_TIMEOUT`` returns a ``task_state="queued"`` status (pending,
+        will run on the next check-in) rather than a timeout error — poll
+        :func:`get_beacon_tasks` to track it.
+        """
         parts = shlex.split(command_line)
         if not parts:
             return err("command_line is empty")
         interactive, kind = await mgr.interact(target_id)
         if interactive is None:
             return err(f"no session or beacon with id {target_id}")
-        res = await _maybe_await(await interactive.execute(parts[0], parts[1:], output))
+        res, pending = await _resolve_exec(
+            await interactive.execute(parts[0], parts[1:], output),
+            kind, target_id, command_line)
+        if pending is not None:
+            return pending
         return ok(target_kind=kind, command=command_line, **serialize_execute(res))
+
+    @tool(tier="passive")
+    async def get_beacon_tasks(beacon_id: str) -> dict:
+        """List tasks queued/sent/completed for a beacon.
+
+        Use after :func:`execute` / :func:`execute_command` on a beacon returns
+        ``task_state="queued"``: each task carries a ``state``
+        (pending/sent/completed) and timing, so the caller can tell whether a
+        queued task has since been picked up. ``pending`` counts the tasks not
+        yet completed.
+        """
+        b = await mgr.client.beacon_by_id(beacon_id)
+        if b is None:
+            return err(f"no beacon with id {beacon_id}")
+        tasks = await mgr.client.beacon_tasks(beacon_id)
+        out = [serialize_beacon_task(t) for t in tasks]
+        pending = sum(1 for t in out
+                      if str(t["state"]).lower() not in ("completed", "canceled"))
+        return ok(beacon_id=beacon_id, tasks=out, count=len(out), pending=pending)
 
     # ======================================================================
     # File operations

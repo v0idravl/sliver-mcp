@@ -37,6 +37,14 @@ The `sliver-ops` skill's CLI block becomes:
 8. mcp__sliver__export_handoff()      # feed internal-dispatch
 ```
 
+**Port 443 is the standing-pool standard.** Every HTTPS listener and pool build
+defaults to port **443**, not 4443 — `start_https_listener`, `generate_beacon` /
+`generate_implant` / `regenerate_or_build`, and `ingest_handoff` all target 443
+when no `port` / `c2_port` is given. Keep the ~5-build standing pool on 443 so a
+reused `pool-https-<osarch>` build always calls back on the same port; a build
+that drifted to 4443 (generated before this standard) should be evicted with
+`remove_implant_build` and rebuilt against 443.
+
 ## Cross-tool handoff
 
 `export_handoff()` returns the same shape family as p0rtix's, so the agent can

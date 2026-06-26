@@ -22,3 +22,6 @@ sliver-payloads/
 # Local
 .DS_Store
 *.log
+
+# Local Claude dev context (not tracked)
+CLAUDE.md

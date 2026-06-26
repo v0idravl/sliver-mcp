@@ -56,7 +56,8 @@ the recon→C2 pivot.
 
 ## Related skills
 
-`c2-tradecraft` (doctrine), `payload-delivery` (beacon delivery),
+`c2-tradecraft` (doctrine), `payload-delivery` (beacon delivery — see
+[`delivery.md`](delivery.md) for session-safe Windows/Linux detachment),
 `session-pivoting` (pivots — note the SOCKS/portfwd limitation in the README),
 `collection-exfil` (download over the C2 channel), and
 `loader-injection-tradecraft` (in-memory stage) all compose with these tools.

@@ -44,6 +44,12 @@ def make_beacon(id="beac-1", **kw):
     return SimpleNamespace(**base)
 
 
+def make_beacon_task(id="task-1", beacon_id="beac-1", state="pending"):
+    return SimpleNamespace(ID=id, BeaconID=beacon_id, State=state,
+                           Description="execute", CreatedAt=0, SentAt=0,
+                           CompletedAt=0, Request=b"", Response=b"")
+
+
 def make_job(id=1, protocol="https", port=443):
     return SimpleNamespace(ID=id, Name="https", Description="", Protocol=protocol,
                            Port=port, Domains=["c2.example.com"])
@@ -110,6 +116,8 @@ class FakeClient:
         self.start_mtls_listener = AsyncMock(return_value=make_listener(3))
         self.start_dns_listener = AsyncMock(return_value=make_listener(4))
         self.start_wg_listener = AsyncMock(return_value=make_listener(5))
+
+        self.beacon_tasks = AsyncMock(return_value=[make_beacon_task()])
 
         self.session_by_id = AsyncMock(side_effect=self._session_by_id)
         self.beacon_by_id = AsyncMock(side_effect=self._beacon_by_id)

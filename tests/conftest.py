@@ -98,6 +98,7 @@ class FakeClient:
         self.jobs = AsyncMock(return_value=[make_job()])
         self.implant_builds = AsyncMock(return_value={})
         self.implant_profiles = AsyncMock(return_value=[])
+        self.delete_implant_build = AsyncMock(return_value=None)
         self.kill_job = AsyncMock(return_value=SimpleNamespace(Success=True))
         self.kill_session = AsyncMock(return_value=None)
         self.kill_beacon = AsyncMock(return_value=None)

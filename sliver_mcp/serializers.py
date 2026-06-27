@@ -11,6 +11,31 @@ from __future__ import annotations
 import gzip
 from typing import Any
 
+# Pool build name convention: pool-<proto>-<osarch>  e.g. pool-https-linuxamd64
+# Longest arches first so "arm64" matches before "arm".
+_KNOWN_ARCHES: tuple[str, ...] = ("arm64", "amd64", "arm", "386")
+_KNOWN_OSES: frozenset[str] = frozenset({"linux", "windows", "darwin"})
+
+
+def parse_osarch_from_name(name: str) -> tuple[str, str]:
+    """Extract (os, arch) from a pool build name (pool-<proto>-<osarch>).
+
+    Supports the pool naming convention used by ``regenerate_or_build``:
+    e.g. ``pool-https-linuxamd64`` -> ``("linux", "amd64")``.
+    Returns ``("", "")`` when the name does not match any known pattern.
+    This is exposed publicly so ``regenerate_or_build`` can reuse it for
+    fallback matching when the proto GOOS/GOARCH fields are empty.
+    """
+    parts = name.split("-")
+    # Take the last segment (e.g. "linuxamd64" from "pool-https-linuxamd64").
+    osarch = parts[-1].lower() if parts else ""
+    for arch in _KNOWN_ARCHES:
+        if osarch.endswith(arch):
+            os_part = osarch[: -len(arch)]
+            if os_part in _KNOWN_OSES:
+                return os_part, arch
+    return "", ""
+
 
 def serialize_version(v: Any) -> dict:
     return {
@@ -153,6 +178,58 @@ def serialize_event(ev: Any) -> dict:
     if data:
         out["data"] = _text(data)
     return out
+
+
+def serialize_implant_build(name: str, c: Any) -> dict:
+    """Project an ImplantConfig from ``implant_builds()`` into a readable dict.
+
+    The Sliver server can return ``ImplantConfig`` objects with empty
+    ``GOOS``/``GOARCH`` for pool builds (the proto metadata was not stored when
+    the build was compiled). When that happens, ``os`` and ``arch`` are derived
+    from the build name via the pool naming convention
+    (``pool-<proto>-<osarch>``) so the caller can confirm a pool hit without
+    relying on proto metadata. The ``os_source`` key identifies whether values
+    came from the proto (``"proto"``) or the build name (``"name"``).
+
+    A ``target_triple`` key (``linux/amd64`` style) is always returned; it is
+    the canonical way the Sliver team server identifies a build's target
+    platform and is what the agent should use when reasoning about pool matches.
+
+    ``c2_urls`` lists the callback URLs baked into the build, matching the C2
+    URL the ``regenerate_or_build`` pool discipline checks against.
+    """
+    goos: str = getattr(c, "GOOS", "") or ""
+    goarch: str = getattr(c, "GOARCH", "") or ""
+    # Forward-compat: newer Sliver proto versions may expose "beacon" (lowercase).
+    is_beacon: bool = bool(
+        getattr(c, "IsBeacon", False) or getattr(c, "beacon", False)
+    )
+    fmt: int = int(getattr(c, "Format", 0))
+    c2_list = getattr(c, "C2", []) or []
+    c2_urls: list[str] = [getattr(entry, "URL", "") for entry in c2_list]
+
+    os_source = "proto"
+    if not goos and not goarch:
+        # Fallback: derive os/arch from the build name when proto fields are blank.
+        goos, goarch = parse_osarch_from_name(name)
+        if goos or goarch:
+            os_source = "name"
+
+    target_triple = (
+        f"{goos}/{goarch}" if (goos and goarch)
+        else goos or goarch  # partial info is still useful
+    )
+
+    return {
+        "name": name,
+        "os": goos,
+        "arch": goarch,
+        "target_triple": target_triple,
+        "is_beacon": is_beacon,
+        "format": fmt,
+        "c2_urls": c2_urls,
+        "os_source": os_source,
+    }
 
 
 def decode_download(d: Any) -> bytes:

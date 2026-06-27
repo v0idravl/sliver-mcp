@@ -49,9 +49,11 @@ from .implant import build_implant_config, c2_url
 from .manager import SliverManager, payload_dir
 from .serializers import (
     decode_download,
+    parse_osarch_from_name,
     serialize_beacon,
     serialize_beacon_task,
     serialize_execute,
+    serialize_implant_build,
     serialize_job,
     serialize_ls,
     serialize_pivot_listener,
@@ -332,18 +334,20 @@ def build_server(manager: SliverManager):
 
     @tool(tier="passive")
     async def list_implant_builds() -> dict:
-        """List previously generated implant builds by name."""
+        """List previously generated implant builds with metadata.
+
+        Returns per-build ``os``, ``arch``, ``target_triple`` (e.g.
+        ``linux/amd64``), ``is_beacon``, ``format``, and ``c2_urls``.
+
+        When the Sliver server stores a build without proto GOOS/GOARCH fields
+        (which happens with some pool builds), os/arch are derived from the
+        build name via the pool naming convention (``pool-<proto>-<osarch>``)
+        and ``os_source`` is ``"name"`` instead of ``"proto"``. This lets the
+        operator confirm a pool hit before calling ``regenerate_or_build``
+        even when the raw proto metadata is blank.
+        """
         builds = await mgr.client.implant_builds()
-        out = [
-            {
-                "name": n,
-                "os": c.GOOS,
-                "arch": c.GOARCH,
-                "is_beacon": c.IsBeacon,
-                "format": int(c.Format),
-            }
-            for n, c in (builds or {}).items()
-        ]
+        out = [serialize_implant_build(n, c) for n, c in (builds or {}).items()]
         return ok(builds=out, count=len(out))
 
     @tool(tier="passive")
@@ -417,12 +421,23 @@ def build_server(manager: SliverManager):
         builds = await mgr.client.implant_builds() or {}
         matched_name: str | None = None
         for build_name, build_cfg in builds.items():
-            if (build_cfg.GOOS != os_n
-                    or build_cfg.GOARCH != arch_n
-                    or build_cfg.Format != cfg.Format):
+            b_goos = getattr(build_cfg, "GOOS", "") or ""
+            b_goarch = getattr(build_cfg, "GOARCH", "") or ""
+            b_fmt = int(getattr(build_cfg, "Format", 0))
+
+            # Fallback: when the Sliver server returns empty GOOS/GOARCH (a known
+            # behaviour for some pool builds), derive os/arch from the build name.
+            if not b_goos and not b_goarch:
+                b_goos, b_goarch = parse_osarch_from_name(build_name)
+                # If Format is also 0 (unset), skip the format check so a name
+                # match on a pool build can still qualify.
+                if b_goos and b_goarch and b_fmt == 0:
+                    b_fmt = cfg.Format  # treat as matching
+
+            if b_goos != os_n or b_goarch != arch_n or b_fmt != cfg.Format:
                 continue
-            for c2 in build_cfg.C2:
-                if c2.URL == expected_url:
+            for c2 in getattr(build_cfg, "C2", []):
+                if getattr(c2, "URL", "") == expected_url:
                     matched_name = build_name
                     break
             if matched_name:

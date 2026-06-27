@@ -225,3 +225,75 @@ async def test_remove_implant_build_blocked_at_green(server, call, connected):
     res = await call(server, "remove_implant_build", {"name": "X"})
     assert res["status"] == "error"
     assert res.get("blocked") is True
+
+
+# ---------------------------------------------------------------------------
+# regenerate_or_build — name-based fallback when proto fields are empty
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_regenerate_or_build_hit_empty_proto_fields(
+    server, call, fake_client, connected
+):
+    """Pool match uses build name when GOOS/GOARCH are empty (the Data-box bug).
+
+    The Sliver server returned pool-https-linuxamd64 with empty GOOS/GOARCH
+    and Format=0; the matching logic must fall back to name parsing so the
+    existing pool build is reused instead of triggering a slow fresh compile.
+    """
+    c2 = _make_c2("https://redir.example.com:443")
+    build_cfg = SimpleNamespace(
+        GOOS="", GOARCH="",   # empty proto fields -- the bug shape
+        Format=0,             # also unset
+        IsBeacon=False,
+        C2=[c2],
+    )
+    fake_client.implant_builds = AsyncMock(
+        return_value={"pool-https-linuxamd64": build_cfg}
+    )
+    fake_client.regenerate_implant = AsyncMock(
+        return_value=SimpleNamespace(
+            File=SimpleNamespace(Name="pool-https-linuxamd64", Data=b"MZ_regen")
+        )
+    )
+
+    res = await call(server, "regenerate_or_build", {
+        "c2_host": "redir.example.com",
+        "protocol": "https",
+        "os": "linux",
+        "arch": "amd64",
+    })
+
+    assert res["status"] == "ok"
+    assert res["reused"] is True
+    assert res["matched_name"] == "pool-https-linuxamd64"
+    assert res["c2"] == "https://redir.example.com:443"
+    fake_client.regenerate_implant.assert_awaited_once_with("pool-https-linuxamd64")
+    connected.generate_implant.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_regenerate_or_build_miss_wrong_name_os(
+    server, call, fake_client, connected
+):
+    """Name-based fallback: build name OS mismatch still produces a miss."""
+    c2 = _make_c2("https://redir.example.com:443")
+    build_cfg = SimpleNamespace(
+        GOOS="", GOARCH="",  # empty proto fields
+        Format=0, IsBeacon=False, C2=[c2],
+    )
+    # Build name says windows but we are requesting linux.
+    fake_client.implant_builds = AsyncMock(
+        return_value={"pool-https-windowsamd64": build_cfg}
+    )
+
+    res = await call(server, "regenerate_or_build", {
+        "c2_host": "redir.example.com",
+        "protocol": "https",
+        "os": "linux",
+        "arch": "amd64",
+    })
+
+    assert res["status"] == "ok"
+    assert res["reused"] is False
+    connected.generate_implant.assert_awaited_once()

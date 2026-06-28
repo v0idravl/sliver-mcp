@@ -87,7 +87,7 @@ a live client return a structured "not connected" error until it succeeds.
 |----------|-------|--------------|
 | Connection / state | `connect`, `status`, `get_version`, `poll_events`, `disconnect` | attach to the team server, check health, drain the async event queue (new callbacks, task results) |
 | Listeners | `start_https_listener`, `start_http_listener`, `start_mtls_listener`, `start_dns_listener`, `start_wg_listener`, `list_jobs`, `kill_job` | stand up / tear down C2 listeners across protocols |
-| Implant generation | `generate_implant`, `generate_beacon`, `list_implant_builds`, `list_implant_profiles`, `regenerate_implant` | build session implants and async beacons; reuse profiles and prior builds |
+| Implant generation | `generate_implant`, `generate_beacon`, `list_implant_builds`, `list_implant_profiles`, `regenerate_implant`, `regenerate_or_build`, `remove_implant_build` | build session implants and async beacons; reuse profiles and prior builds; prune stale builds |
 | Sessions / beacons | `list_sessions`, `list_beacons`, `session_info`, `beacon_info`, `kill_session`, `kill_beacon` | enumerate and inspect callbacks; retire them |
 | Execution | `execute`, `execute_command`, `get_beacon_tasks` | run a binary / run a shell command on a session or beacon; poll a beacon's queued/completed tasks |
 | File operations | `ls`, `pwd`, `cd`, `mkdir`, `download`, `upload`, `rm` | navigate and move files on the target |

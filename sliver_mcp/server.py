@@ -1276,6 +1276,32 @@ def build_server(manager: SliverManager):
         return await handoff.build_export(mgr.client, mgr.safety.snapshot(),
                                           mgr.operator)
 
+    @tool(tier="green", requires_client=False)
+    async def open_store(engagement: str) -> dict:
+        """Open (or create) a dagar-state SQLite store for this engagement.
+
+        engagement: human name / box slug (e.g. "htb-conversor"). Future
+        ingest_handoff calls and incoming session events will populate it.
+        """
+        try:
+            db_path = mgr.open_store(engagement)
+        except RuntimeError as exc:
+            return err(str(exc))
+        return ok(f"engagement store opened for '{engagement}'", db_path=db_path)
+
+    @tool(tier="passive", requires_client=False)
+    async def export_state() -> dict:
+        """Export the current dagar-state engagement store as structured JSON.
+
+        Returns hosts, services, creds, sessions, privileges, and routes.
+        Requires open_store to have been called first.
+        """
+        if mgr.store is None:
+            return err("no engagement store open — call open_store first")
+        data = mgr.store.export_json()
+        counts = {k: len(v) for k, v in data.items()}
+        return ok("engagement state exported", counts=counts, **data)
+
     @tool(tier="green")
     async def ingest_handoff(handoff_data: dict) -> dict:
         """Stand up a listener + beacon from a p0rtix/msf-style handoff.
@@ -1283,7 +1309,15 @@ def build_server(manager: SliverManager):
         Accepts loose keys (redirector/callback_domain/domain/lhost/host/hosts,
         protocol, port, os, arch) and creates a matching listener, then generates
         a matching beacon. Honors the current noise ceiling.
+
+        If a dagar-state store is open (via open_store), seeds it with any
+        host/service/credential facts present in the handoff.
         """
+        if mgr.store is not None:
+            try:
+                mgr.store.import_from_portix_facts(handoff_data)
+            except Exception:
+                pass
         plan = handoff.normalize_ingest(handoff_data)
         proto = plan["protocol"]
 

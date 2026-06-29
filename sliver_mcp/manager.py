@@ -60,6 +60,8 @@ class SliverManager:
         self._socks_proxies: dict[int, asyncio.Task] = {}
         self._portfwd_proxies: dict[int, asyncio.Task] = {}
         self._tunnel_lock = asyncio.Lock()
+        # dagar-state engagement store (optional, opened by open_store())
+        self._store: Any = None  # EngagementStore | None
 
     # -- connection ---------------------------------------------------------
     @property
@@ -174,11 +176,60 @@ class SliverManager:
     async def _pump_events(self) -> None:
         try:
             async for event in self._client.events():
-                self._events.append(serialize_event(event))
+                ev = serialize_event(event)
+                self._events.append(ev)
+                self._store_event(ev)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # surface, don't die silently
             self._events.append({"type": "_pump_error", "message": str(exc)})
+
+    def _store_event(self, ev: dict) -> None:
+        """Write session/beacon connection events to the dagar-state store."""
+        if self._store is None:
+            return
+        ev_type = ev.get("type", "")
+        sess = ev.get("session")
+        beacon = ev.get("beacon")
+        try:
+            if ev_type == "session-connected" and sess:
+                ip = getattr(sess.get("remote_address", ""), "split", lambda _: [""])(":")[0]
+                self._store.register_session(
+                    sess["id"], "sliver_session",
+                    ip or "unknown",
+                    implant_name=sess.get("name"),
+                    user=sess.get("username"),
+                )
+            elif ev_type == "session-disconnected" and sess:
+                self._store.mark_session_dead(sess["id"])
+            elif ev_type == "beacon-registered" and beacon:
+                ip = getattr(beacon.get("remote_address", ""), "split", lambda _: [""])(":")[0]
+                self._store.register_session(
+                    beacon["id"], "sliver_beacon",
+                    ip or "unknown",
+                    implant_name=beacon.get("name"),
+                    user=beacon.get("username"),
+                )
+        except Exception:
+            pass
+
+    # -- dagar-state store -------------------------------------------------
+    @property
+    def store(self) -> Any:
+        return self._store
+
+    def open_store(self, engagement: str) -> str:
+        try:
+            from dagar_state.store import EngagementStore
+        except ImportError as exc:
+            raise RuntimeError("dagar-state not installed — run: pip install -e ~/projects/dagar-state") from exc
+        self._store = EngagementStore(engagement)
+        return self._store.db_path
+
+    def close_store(self) -> None:
+        if self._store is not None:
+            self._store.close()
+            self._store = None
 
     def drain_events(self) -> list[dict]:
         out = list(self._events)

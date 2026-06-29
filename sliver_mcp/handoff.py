@@ -74,14 +74,18 @@ def normalize_ingest(handoff: dict) -> dict:
     host = (
         handoff.get("redirector")
         or handoff.get("callback_domain")
-        or handoff.get("domain")
         or handoff.get("lhost")
         or handoff.get("host")
     )
     if not host:
+        # p0rtix export_handoff now emits hosts[] as a list of dicts; fall back to
+        # the legacy list-of-strings shape so both formats are handled.
         hosts = handoff.get("hosts")
         if isinstance(hosts, list) and hosts:
-            host = hosts[0]
+            first = hosts[0]
+            host = first.get("ip") if isinstance(first, dict) else str(first)
+    if not host:
+        host = handoff.get("domain")
     if not host:
         raise ValueError(
             "no callback host found in handoff (expected one of: redirector, "

@@ -1218,9 +1218,22 @@ def build_server(manager: SliverManager):
             port = await mgr.start_socks(session_id, local_port)
         except ValueError as exc:
             return err(str(exc))
+        _PROXYCHAINS_CONF = Path.home() / ".cache" / "dagar-proxychains.conf"
+        _PROXYCHAINS_CONF.parent.mkdir(exist_ok=True)
+        _PROXYCHAINS_CONF.write_text(
+            "strict_chain\nproxy_dns\n\n[ProxyList]\n"
+            f"socks5  127.0.0.1  {port}\n"
+        )
+        if mgr.store is not None:
+            try:
+                mgr.store.add_route(session_id, "0.0.0.0/0",
+                                    f"socks5://127.0.0.1:{port}")
+            except Exception:
+                pass
         return ok(f"SOCKS5 proxy started on 127.0.0.1:{port}",
                   session_id=session_id, local_port=port,
-                  proxychains=f"socks5 127.0.0.1 {port}")
+                  proxychains=f"socks5 127.0.0.1 {port}",
+                  proxychains_conf=str(_PROXYCHAINS_CONF))
 
     @tool(tier="yellow")
     async def stop_socks(local_port: int) -> dict:
@@ -1228,6 +1241,7 @@ def build_server(manager: SliverManager):
         stopped = await mgr.stop_socks(local_port)
         if not stopped:
             return err(f"no SOCKS5 proxy found on port {local_port}")
+        (Path.home() / ".cache" / "dagar-proxychains.conf").unlink(missing_ok=True)
         return ok(f"SOCKS5 proxy on port {local_port} stopped", local_port=local_port)
 
     @tool(tier="yellow")

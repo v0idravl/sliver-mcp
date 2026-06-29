@@ -56,6 +56,10 @@ class SliverManager:
         self.safety = SafetyState()
         self.last_config_path: str | None = None
         self.operator: str = ""
+        # Tunnel registry: local_port → asyncio.Task
+        self._socks_proxies: dict[int, asyncio.Task] = {}
+        self._portfwd_proxies: dict[int, asyncio.Task] = {}
+        self._tunnel_lock = asyncio.Lock()
 
     # -- connection ---------------------------------------------------------
     @property
@@ -180,3 +184,284 @@ class SliverManager:
         out = list(self._events)
         self._events.clear()
         return out
+
+    # -- SOCKS5 / portfwd tunnels ------------------------------------------
+    def list_tunnels(self) -> dict:
+        return {
+            "socks": list(self._socks_proxies.keys()),
+            "portfwd": list(self._portfwd_proxies.keys()),
+        }
+
+    async def start_socks(self, session_id: str, local_port: int) -> int:
+        async with self._tunnel_lock:
+            if local_port in self._socks_proxies:
+                raise ValueError(f"SOCKS proxy already active on port {local_port}")
+            task = asyncio.ensure_future(
+                self._socks_proxy_loop(session_id, local_port))
+            self._socks_proxies[local_port] = task
+        return local_port
+
+    async def stop_socks(self, local_port: int) -> bool:
+        async with self._tunnel_lock:
+            task = self._socks_proxies.pop(local_port, None)
+            if task is not None:
+                task.cancel()
+                return True
+        return False
+
+    async def start_portfwd(self, session_id: str, local_port: int,
+                             remote_host: str, remote_port: int) -> int:
+        async with self._tunnel_lock:
+            if local_port in self._portfwd_proxies:
+                raise ValueError(f"portfwd already active on port {local_port}")
+            task = asyncio.ensure_future(
+                self._portfwd_proxy_loop(session_id, local_port, remote_host, remote_port))
+            self._portfwd_proxies[local_port] = task
+        return local_port
+
+    async def stop_portfwd(self, local_port: int) -> bool:
+        async with self._tunnel_lock:
+            task = self._portfwd_proxies.pop(local_port, None)
+            if task is not None:
+                task.cancel()
+                return True
+        return False
+
+    async def _socks_proxy_loop(self, session_id: str, local_port: int) -> None:
+        from sliver.pb.sliverpb import sliver_pb2 as _sliverpb
+        from sliver.pb.commonpb import common_pb2 as _commonpb
+
+        channel = getattr(self._client, "_channel", None)
+        if channel is None:
+            return
+
+        create_socks = channel.unary_unary(
+            "/rpcpb.SliverRPC/CreateSocks",
+            request_serializer=_sliverpb.Socks.SerializeToString,
+            response_deserializer=_sliverpb.Socks.FromString,
+        )
+        proxy_mc = channel.stream_stream(
+            "/rpcpb.SliverRPC/SocksProxy",
+            request_serializer=_sliverpb.SocksData.SerializeToString,
+            response_deserializer=_sliverpb.SocksData.FromString,
+        )
+        proxy_stream = proxy_mc()
+
+        conn_map: dict[int, asyncio.StreamWriter] = {}
+        send_lock = asyncio.Lock()
+
+        async def recv_loop() -> None:
+            try:
+                async for msg in proxy_stream:
+                    writer = conn_map.get(msg.TunnelID)
+                    if writer is None:
+                        continue
+                    if msg.CloseConn:
+                        conn_map.pop(msg.TunnelID, None)
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                    elif msg.Data:
+                        writer.write(msg.Data)
+                        try:
+                            await writer.drain()
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        async def handle_conn(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            tunnel_id = 0
+            request = _commonpb.Request(SessionID=session_id)
+            try:
+                resp = await create_socks(_sliverpb.Socks(SessionID=session_id))
+                tunnel_id = resp.TunnelID
+                conn_map[tunnel_id] = writer
+                seq = 0
+                while True:
+                    data = await reader.read(32768)
+                    if not data:
+                        break
+                    async with send_lock:
+                        await proxy_stream.write(_sliverpb.SocksData(
+                            TunnelID=tunnel_id,
+                            Data=data,
+                            Sequence=seq,
+                            Request=request,
+                        ))
+                    seq += 1
+            except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+                pass
+            except Exception:
+                pass
+            finally:
+                conn_map.pop(tunnel_id, None)
+                if tunnel_id:
+                    try:
+                        async with send_lock:
+                            await proxy_stream.write(_sliverpb.SocksData(
+                                TunnelID=tunnel_id,
+                                CloseConn=True,
+                                Request=request,
+                            ))
+                    except Exception:
+                        pass
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        recv_task = asyncio.ensure_future(recv_loop())
+        try:
+            server = await asyncio.start_server(handle_conn, "127.0.0.1", local_port)
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            recv_task.cancel()
+            try:
+                await proxy_stream.done_writing()
+            except Exception:
+                pass
+            async with self._tunnel_lock:
+                self._socks_proxies.pop(local_port, None)
+
+    async def _portfwd_proxy_loop(self, session_id: str, local_port: int,
+                                   remote_host: str, remote_port: int) -> None:
+        from sliver.pb.sliverpb import sliver_pb2 as _sliverpb
+        from sliver.pb.commonpb import common_pb2 as _commonpb
+
+        channel = getattr(self._client, "_channel", None)
+        if channel is None:
+            return
+
+        create_tunnel = channel.unary_unary(
+            "/rpcpb.SliverRPC/CreateTunnel",
+            request_serializer=_sliverpb.Tunnel.SerializeToString,
+            response_deserializer=_sliverpb.Tunnel.FromString,
+        )
+        close_tunnel = channel.unary_unary(
+            "/rpcpb.SliverRPC/CloseTunnel",
+            request_serializer=_sliverpb.Tunnel.SerializeToString,
+            response_deserializer=lambda b: b,
+        )
+        portfwd_rpc = channel.unary_unary(
+            "/rpcpb.SliverRPC/Portfwd",
+            request_serializer=_sliverpb.PortfwdReq.SerializeToString,
+            response_deserializer=_sliverpb.Portfwd.FromString,
+        )
+        tunnel_mc = channel.stream_stream(
+            "/rpcpb.SliverRPC/TunnelData",
+            request_serializer=_sliverpb.TunnelData.SerializeToString,
+            response_deserializer=_sliverpb.TunnelData.FromString,
+        )
+        tunnel_stream = tunnel_mc()
+
+        conn_map: dict[int, asyncio.StreamWriter] = {}
+        send_lock = asyncio.Lock()
+
+        async def recv_loop() -> None:
+            try:
+                async for msg in tunnel_stream:
+                    writer = conn_map.get(msg.TunnelID)
+                    if writer is None:
+                        continue
+                    if msg.Closed:
+                        conn_map.pop(msg.TunnelID, None)
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                    elif msg.Data:
+                        writer.write(msg.Data)
+                        try:
+                            await writer.drain()
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
+        async def handle_conn(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            tunnel_id = 0
+            try:
+                tun = await create_tunnel(_sliverpb.Tunnel(SessionID=session_id))
+                tunnel_id = tun.TunnelID
+                conn_map[tunnel_id] = writer
+
+                pf_resp = await portfwd_rpc(_sliverpb.PortfwdReq(
+                    Host=remote_host,
+                    Port=remote_port,
+                    Protocol=1,  # PortFwdProtoTCP
+                    TunnelID=tunnel_id,
+                    Request=_commonpb.Request(SessionID=session_id),
+                ))
+                if (pf_resp.Response is not None
+                        and getattr(pf_resp.Response, "Err", "")):
+                    return
+
+                seq = 0
+                while True:
+                    data = await reader.read(32768)
+                    if not data:
+                        break
+                    async with send_lock:
+                        await tunnel_stream.write(_sliverpb.TunnelData(
+                            TunnelID=tunnel_id,
+                            SessionID=session_id,
+                            Data=data,
+                            Sequence=seq,
+                        ))
+                    seq += 1
+            except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+                pass
+            except Exception:
+                pass
+            finally:
+                conn_map.pop(tunnel_id, None)
+                if tunnel_id:
+                    try:
+                        async with send_lock:
+                            await tunnel_stream.write(_sliverpb.TunnelData(
+                                TunnelID=tunnel_id,
+                                SessionID=session_id,
+                                Closed=True,
+                            ))
+                    except Exception:
+                        pass
+                    try:
+                        await close_tunnel(_sliverpb.Tunnel(
+                            TunnelID=tunnel_id, SessionID=session_id))
+                    except Exception:
+                        pass
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        recv_task = asyncio.ensure_future(recv_loop())
+        try:
+            server = await asyncio.start_server(handle_conn, "127.0.0.1", local_port)
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            recv_task.cancel()
+            try:
+                await tunnel_stream.done_writing()
+            except Exception:
+                pass
+            async with self._tunnel_lock:
+                self._portfwd_proxies.pop(local_port, None)

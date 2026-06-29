@@ -1189,6 +1189,81 @@ def build_server(manager: SliverManager):
                   count=len(pivots))
 
     # ======================================================================
+    # Tunnels — SOCKS5 proxy and static port-forward via gRPC streaming
+    # ======================================================================
+    @tool(tier="green")
+    async def list_tunnels() -> dict:
+        """List active SOCKS5 proxies and port-forwards started by this MCP."""
+        info = mgr.list_tunnels()
+        return ok(
+            socks_proxies=info["socks"],
+            portfwds=info["portfwd"],
+            socks_count=len(info["socks"]),
+            portfwd_count=len(info["portfwd"]),
+        )
+
+    @tool(tier="yellow")
+    async def start_socks(session_id: str, local_port: int = 1080) -> dict:
+        """Start a SOCKS5 proxy on local_port routed through a Sliver session.
+
+        Once started, point proxychains / curl --socks5 / Impacket at
+        127.0.0.1:<local_port>.  The Sliver server handles SOCKS5 negotiation;
+        the client just pipes raw bytes.
+        session_id: active session ID (not beacon — sessions only)
+        local_port: TCP port to bind on localhost (default 1080)
+        """
+        if local_port < 1 or local_port > 65535:
+            return err("local_port must be 1–65535")
+        try:
+            port = await mgr.start_socks(session_id, local_port)
+        except ValueError as exc:
+            return err(str(exc))
+        return ok(f"SOCKS5 proxy started on 127.0.0.1:{port}",
+                  session_id=session_id, local_port=port,
+                  proxychains=f"socks5 127.0.0.1 {port}")
+
+    @tool(tier="yellow")
+    async def stop_socks(local_port: int) -> dict:
+        """Stop an active SOCKS5 proxy on local_port."""
+        stopped = await mgr.stop_socks(local_port)
+        if not stopped:
+            return err(f"no SOCKS5 proxy found on port {local_port}")
+        return ok(f"SOCKS5 proxy on port {local_port} stopped", local_port=local_port)
+
+    @tool(tier="yellow")
+    async def start_portfwd(session_id: str, local_port: int,
+                             remote_host: str, remote_port: int) -> dict:
+        """Forward local_port → remote_host:remote_port via a Sliver session.
+
+        The implant makes the TCP connection to remote_host:remote_port; data
+        flows through the TunnelData gRPC stream back to local_port.
+        session_id: active session ID (not beacon)
+        local_port: TCP port to bind on localhost
+        remote_host: target host the implant should connect to
+        remote_port: target port
+        """
+        if local_port < 1 or local_port > 65535:
+            return err("local_port must be 1–65535")
+        if remote_port < 1 or remote_port > 65535:
+            return err("remote_port must be 1–65535")
+        try:
+            port = await mgr.start_portfwd(session_id, local_port,
+                                            remote_host, remote_port)
+        except ValueError as exc:
+            return err(str(exc))
+        return ok(f"portfwd started: 127.0.0.1:{port} → {remote_host}:{remote_port}",
+                  session_id=session_id, local_port=port,
+                  remote_host=remote_host, remote_port=remote_port)
+
+    @tool(tier="yellow")
+    async def stop_portfwd(local_port: int) -> dict:
+        """Stop an active port-forward on local_port."""
+        stopped = await mgr.stop_portfwd(local_port)
+        if not stopped:
+            return err(f"no portfwd found on port {local_port}")
+        return ok(f"portfwd on port {local_port} stopped", local_port=local_port)
+
+    # ======================================================================
     # Handoff
     # ======================================================================
     @tool(tier="passive")

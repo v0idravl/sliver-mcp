@@ -144,3 +144,34 @@ If the target has an **SMB share** or **FTP** that the operator can write to
 > Note: pool builds (`pool-https-win32`) are normally obfuscated and will exceed
 > the delivery limit on Win2003/XP. Keep a separate slim build in the pool when
 > working legacy targets, or generate one on demand and remove it after use.
+
+## Unsupported target OS: FreeBSD
+
+**Sliver 1.7.3 does not support FreeBSD as a target OS.** Calling
+`regenerate_or_build(os="freebsd", ...)` returns:
+
+```
+os must be one of ['darwin', 'linux', 'windows']
+```
+
+This is a Sliver toolchain constraint, not a sliver-mcp bug. The Sliver team
+server's build system (Go cross-compilation) targets the three GOOS values
+above; FreeBSD is not in the supported matrix.
+
+### Affected targets
+
+Any FreeBSD host: pfSense appliances (pfSense 2.x runs on FreeBSD 10-12),
+bare-metal FreeBSD servers, jail/container environments with FreeBSD userland.
+
+### Fallback approaches for FreeBSD targets
+
+| Option | Notes |
+|---|---|
+| PHP webshell | When the target exposes a PHP application (e.g. pfSense web UI), write a webshell via command injection and drive it directly. No implant needed for flag collection. |
+| Meterpreter `generic/shell` | A Metasploit generic reverse-shell payload works on FreeBSD when a netcat/sh callback is viable. |
+| Manual command injection | If RCE exists, execute commands directly via the injection point without a persistent implant. |
+| Sliver with FreeBSD support | If Sliver adds `freebsd` to the GOOS matrix in a future release, update `regenerate_or_build`'s `os` parameter docs and re-test. |
+
+For confirmed FreeBSD targets, skip `regenerate_or_build` entirely and note
+`sliver_skipped: freebsd_not_supported` in the engagement record. Collect flags
+via whatever shell/webshell access is available.

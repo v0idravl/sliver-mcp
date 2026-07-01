@@ -177,6 +177,68 @@ def build_server(manager: SliverManager):
         await mgr.disconnect()
         return ok("disconnected")
 
+    _SLIVER_RESTART_CMD = (
+        "/home/v0idravl/sliver-bin/sliver-server daemon -l 127.0.0.1 -p 31337"
+    )
+
+    @tool(tier="passive", requires_client=False)
+    async def check_server(
+        host: str = "127.0.0.1",
+        port: int = 31337,
+    ) -> dict:
+        """Probe the Sliver daemon gRPC port and report whether it is running.
+
+        Useful at session start to confirm the team server is up before calling
+        ``connect()``. If the port is not reachable, the exact restart command is
+        returned so the operator can bring the daemon up without leaving the
+        context.
+
+        Default ``host``/``port`` match the sliver-server daemon defaults
+        (127.0.0.1:31337). Adjust only if the daemon was started on a non-default
+        address.
+
+        Returns:
+            server_up=True  — daemon is listening; proceed with connect().
+            server_up=False — port refused or timed out; restart_command tells
+                              the operator exactly how to start the daemon.
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=2.0
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return ok(
+                "server is UP",
+                server_up=True,
+                host=host,
+                port=port,
+            )
+        except asyncio.TimeoutError:
+            # TimeoutError is a subclass of OSError in Python 3 — must be
+            # caught BEFORE the broader OSError clause below.
+            return ok(
+                "server NOT RUNNING — connection timed out",
+                server_up=False,
+                host=host,
+                port=port,
+                restart_command=_SLIVER_RESTART_CMD,
+                hint=f"Connection to {host}:{port} timed out. "
+                     f"Start the Sliver daemon with: {_SLIVER_RESTART_CMD}",
+            )
+        except (ConnectionRefusedError, OSError):
+            return ok(
+                "server NOT RUNNING — connection refused",
+                server_up=False,
+                host=host,
+                port=port,
+                restart_command=_SLIVER_RESTART_CMD,
+                hint=f"Start the Sliver daemon with: {_SLIVER_RESTART_CMD}",
+            )
+
     # ======================================================================
     # Listeners (C2 infrastructure)
     # ======================================================================
